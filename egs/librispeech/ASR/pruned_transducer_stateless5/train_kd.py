@@ -65,7 +65,7 @@ from joiner import Joiner
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
-from model import Transducer
+from model import KD_transducer, Transducer
 from optim import Eden, Eve
 from torch import Tensor
 from torch.cuda.amp import GradScaler
@@ -228,8 +228,18 @@ def get_parser():
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="pruned_transducer_stateless5/exp",
+        default="pruned_transducer_stateless5/exp-960-streaming",
         help="""The experiment dir.
+        It specifies the directory where all training related
+        files, e.g., checkpoints, log, etc, are saved
+        """,
+    )
+
+    parser.add_argument(
+        "--teacher-exp-dir",
+        type=str,
+        default="pruned_transducer_stateless5/exp-960",
+        help="""The teacher model experiment dir.
         It specifies the directory where all training related
         files, e.g., checkpoints, log, etc, are saved
         """,
@@ -303,6 +313,20 @@ def get_parser():
         "loss(joiner is just addition), this simple loss also uses for"
         "training (as a regularization item). We will scale the simple loss"
         "with this parameter before adding to the final loss.",
+    )
+
+    parser.add_argument(
+        "--kd-scale",
+        type=float,
+        default=0.3,
+        help="The scale of Knowledge distillation loss part.",
+    )
+
+    parser.add_argument(
+        "--kd-type",
+        type=str,
+        default='kl',
+        help="The type of KD loss.",
     )
 
     parser.add_argument(
@@ -444,20 +468,34 @@ def get_params() -> AttributeDict:
     return params
 
 
-def get_encoder_model(params: AttributeDict) -> nn.Module:
+def get_encoder_model(params: AttributeDict, teacher: bool) -> nn.Module:
     # TODO: We can add an option to switch between Conformer and Transformer
-    encoder = Conformer(
+    if teacher:
+        encoder = Conformer(
         num_features=params.feature_dim,
         subsampling_factor=params.subsampling_factor,
         d_model=params.encoder_dim,
         nhead=params.nhead,
         dim_feedforward=params.dim_feedforward,
         num_encoder_layers=params.num_encoder_layers,
-        dynamic_chunk_training=params.dynamic_chunk_training,
+        dynamic_chunk_training=not params.dynamic_chunk_training,
         short_chunk_size=params.short_chunk_size,
         num_left_chunks=params.num_left_chunks,
-        causal=params.causal_convolution,
-    )
+        causal=not params.causal_convolution,
+        )
+    else:
+        encoder = Conformer(
+            num_features=params.feature_dim,
+            subsampling_factor=params.subsampling_factor,
+            d_model=params.encoder_dim,
+            nhead=params.nhead,
+            dim_feedforward=params.dim_feedforward,
+            num_encoder_layers=params.num_encoder_layers,
+            dynamic_chunk_training=params.dynamic_chunk_training,
+            short_chunk_size=params.short_chunk_size,
+            num_left_chunks=params.num_left_chunks,
+            causal=params.causal_convolution,
+        )
     return encoder
 
 
@@ -481,12 +519,13 @@ def get_joiner_model(params: AttributeDict) -> nn.Module:
     return joiner
 
 
-def get_transducer_model(params: AttributeDict) -> nn.Module:
-    encoder = get_encoder_model(params)
+def get_transducer_model(params: AttributeDict, teacher: bool = False) -> nn.Module:
+    
+    encoder = get_encoder_model(params, teacher)
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
 
-    model = Transducer(
+    model = KD_transducer(
         encoder=encoder,
         decoder=decoder,
         joiner=joiner,
@@ -504,6 +543,7 @@ def load_checkpoint_if_available(
     model_avg: nn.Module = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[LRSchedulerType] = None,
+    teacher: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Load checkpoint from file.
 
@@ -530,6 +570,18 @@ def load_checkpoint_if_available(
     Returns:
       Return a dict containing previously saved training info.
     """
+    if teacher == True:
+        filename = params.teacher_exp_dir + "/" + f"epoch-{params.num_epochs}.pt"
+        saved_params = load_checkpoint(
+        filename,
+        model=model,
+        model_avg=model_avg,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        )
+        return saved_params
+
+
     if params.start_batch > 0:
         filename = params.exp_dir / f"checkpoint-{params.start_batch}.pt"
     elif params.start_epoch > 1:
@@ -616,7 +668,8 @@ def save_checkpoint(
 
 def compute_loss(
     params: AttributeDict,
-    model: Union[nn.Module, DDP],
+    teacher_model: nn.Module,
+    student_model: Union[nn.Module, DDP],
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
@@ -640,7 +693,7 @@ def compute_loss(
      warmup: a floating point value which increases throughout training;
         values >= 1.0 are fully warmed up and have all modules present.
     """
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    device = student_model.device if isinstance(student_model, DDP) else next(student_model.parameters()).device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
@@ -652,9 +705,25 @@ def compute_loss(
     texts = batch["supervisions"]["text"]
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
+    
+    # teacher model
+    with torch.no_grad():
+        _, _, t_logits = teacher_model(
+            x=feature,
+            x_lens=feature_lens,
+            y=y,
+            prune_range=params.prune_range,
+            am_scale=params.am_scale,
+            lm_scale=params.lm_scale,
+            warmup=warmup,
+            reduction="none",
+            delay_penalty=params.delay_penalty if warmup >= 2.0 else 0,
+            calculate_loss=False
+        )
 
+    # student model
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss = model(
+        s_simple_loss, s_pruned_loss, s_logits = student_model(
             x=feature,
             x_lens=feature_lens,
             y=y,
@@ -665,18 +734,18 @@ def compute_loss(
             reduction="none",
             delay_penalty=params.delay_penalty if warmup >= 2.0 else 0,
         )
-        simple_loss_is_finite = torch.isfinite(simple_loss)
-        pruned_loss_is_finite = torch.isfinite(pruned_loss)
+        simple_loss_is_finite = torch.isfinite(s_simple_loss)
+        pruned_loss_is_finite = torch.isfinite(s_pruned_loss)
         is_finite = simple_loss_is_finite & pruned_loss_is_finite
         if not torch.all(is_finite):
             logging.info(
                 "Not all losses are finite!\n"
-                f"simple_loss: {simple_loss}\n"
-                f"pruned_loss: {pruned_loss}"
+                f"simple_loss: {s_simple_loss}\n"
+                f"pruned_loss: {s_pruned_loss}"
             )
             display_and_save_batch(batch, params=params, sp=sp)
-            simple_loss = simple_loss[simple_loss_is_finite]
-            pruned_loss = pruned_loss[pruned_loss_is_finite]
+            s_simple_loss = s_simple_loss[simple_loss_is_finite]
+            s_pruned_loss = s_pruned_loss[pruned_loss_is_finite]
 
             # If the batch contains more than 10 utterances AND
             # if either all simple_loss or pruned_loss is inf or nan,
@@ -687,8 +756,8 @@ def compute_loss(
                     "leading to inf or nan losses."
                 )
 
-        simple_loss = simple_loss.sum()
-        pruned_loss = pruned_loss.sum()
+        s_simple_loss = s_simple_loss.sum()
+        s_pruned_loss = s_pruned_loss.sum()
         # after the main warmup step, we keep pruned_loss_scale small
         # for the same amount of time (model_warm_step), to avoid
         # overwhelming the simple_loss and causing it to diverge,
@@ -696,10 +765,18 @@ def compute_loss(
         pruned_loss_scale = (
             0.0 if warmup < 1.0 else (0.1 if warmup > 1.0 and warmup < 2.0 else 1.0)
         )
-        loss = params.simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+        s_loss = params.simple_loss_scale * s_simple_loss + pruned_loss_scale * s_pruned_loss
 
-    assert loss.requires_grad == is_training
+    assert s_loss.requires_grad == is_training
+    kl_div = nn.KLDivLoss(reduction="sum")
 
+    input = nn.functional.log_softmax(s_logits, dim=-1)
+    target = nn.functional.softmax(t_logits, dim=-1)
+
+    kl_loss = kl_div(input, target) / 100
+
+    loss = params.kd_scale * kl_loss + (1 - params.kd_scale) * s_loss
+    
     info = MetricsTracker()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -720,49 +797,55 @@ def compute_loss(
 
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
-    info["simple_loss"] = simple_loss.detach().cpu().item()
-    info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    info["kl_loss"] = kl_loss.detach().cpu().item()
+    info["simple_loss"] = s_simple_loss.detach().cpu().item()
+    info["pruned_loss"] = s_pruned_loss.detach().cpu().item()
 
     return loss, info
 
 
 def compute_validation_loss(
     params: AttributeDict,
-    model: Union[nn.Module, DDP],
+    teacher_model: Union[nn.Module, DDP],
+    student_model: Union[nn.Module, DDP],
     sp: spm.SentencePieceProcessor,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
 ) -> MetricsTracker:
     """Run the validation process."""
-    model.eval()
-
+    student_model.eval()
+    teacher_model.eval()
     tot_loss = MetricsTracker()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(valid_dl):
+            loss, loss_info = compute_loss(
+                params=params,
+                teacher_model=teacher_model,
+                student_model=student_model,
+                sp=sp,
+                batch=batch,
+                is_training=False,
+            )
+            assert loss.requires_grad is False
+            tot_loss = tot_loss + loss_info
 
-    for batch_idx, batch in enumerate(valid_dl):
-        loss, loss_info = compute_loss(
-            params=params,
-            model=model,
-            sp=sp,
-            batch=batch,
-            is_training=False,
-        )
-        assert loss.requires_grad is False
-        tot_loss = tot_loss + loss_info
 
-    if world_size > 1:
-        tot_loss.reduce(loss.device)
+        if world_size > 1:
+            tot_loss.reduce(loss.device)
 
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
-    if loss_value < params.best_valid_loss:
-        params.best_valid_epoch = params.cur_epoch
-        params.best_valid_loss = loss_value
+        loss_value = tot_loss["loss"] / tot_loss["frames"]
+        
+        if loss_value < params.best_valid_loss:
+            params.best_valid_epoch = params.cur_epoch
+            params.best_valid_loss = loss_value
 
     return tot_loss
 
 
 def train_one_epoch(
     params: AttributeDict,
-    model: Union[nn.Module, DDP],
+    teacher_model: Union[nn.Module, DDP],
+    student_model: Union[nn.Module, DDP],
     optimizer: torch.optim.Optimizer,
     scheduler: LRSchedulerType,
     sp: spm.SentencePieceProcessor,
@@ -805,7 +888,8 @@ def train_one_epoch(
         The rank of the node in DDP training. If no DDP is used, it should
         be set to 0.
     """
-    model.train()
+    teacher_model.eval()
+    student_model.train()
 
     tot_loss = MetricsTracker()
 
@@ -818,7 +902,8 @@ def train_one_epoch(
                 if params.delay_penalty == 0:
                     loss, loss_info = compute_loss(
                         params=params,
-                        model=model,
+                        teacher_model=teacher_model,
+                        student_model=student_model,
                         sp=sp,
                         batch=batch,
                         is_training=True,
@@ -827,12 +912,14 @@ def train_one_epoch(
                 else:
                     loss, loss_info = compute_loss(
                         params=params,
-                        model=model,
+                        teacher_model=teacher_model,
+                        student_model=student_model,
                         sp=sp,
                         batch=batch,
                         is_training=True,
                         warmup=2.0,
                     )
+                
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
@@ -857,7 +944,7 @@ def train_one_epoch(
         ):
             update_averaged_model(
                 params=params,
-                model_cur=model,
+                model_cur=student_model,
                 model_avg=model_avg,
             )
 
@@ -868,7 +955,7 @@ def train_one_epoch(
             save_checkpoint_with_global_batch_idx(
                 out_dir=params.exp_dir,
                 global_batch_idx=params.batch_idx_train,
-                model=model,
+                model=student_model,
                 model_avg=model_avg,
                 params=params,
                 optimizer=optimizer,
@@ -906,12 +993,13 @@ def train_one_epoch(
             logging.info("Computing validation loss")
             valid_info = compute_validation_loss(
                 params=params,
-                model=model,
+                teacher_model=teacher_model,
+                student_model=student_model,
                 sp=sp,
                 valid_dl=valid_dl,
                 world_size=world_size,
             )
-            model.train()
+            student_model.train()
             logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
             if tb_writer is not None:
                 valid_info.write_summary(
@@ -974,28 +1062,43 @@ def run(rank, world_size, args):
     logging.info(params)
 
     logging.info("About to create model")
-    model = get_transducer_model(params)
+    teacher_model = get_transducer_model(params, teacher=True)
+    student_model = get_transducer_model(params, teacher=False)
 
-    num_param = sum([p.numel() for p in model.parameters()])
-    logging.info(f"Number of model parameters: {num_param}")
+    teacher_num_param = sum([p.numel() for p in teacher_model.parameters()])
+    student_num_param = sum([p.numel() for p in student_model.parameters()])
+    num_param = teacher_num_param + student_num_param
+    logging.info(f"Number of total model parameters: {num_param}, teacher model parameters: {teacher_num_param} student model parameters: {student_num_param}")
 
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
     if rank == 0:
         # model_avg is only used with rank 0
-        model_avg = copy.deepcopy(model)
+        model_avg = copy.deepcopy(student_model)
+
+    teacher_model_avg: Optional[nn.Module] = None
+    if rank == 0:
+        # model_avg is only used with rank 0
+        teacher_model_avg = copy.deepcopy(teacher_model)
 
     assert params.start_epoch > 0, params.start_epoch
+    teacher_checkpoints = load_checkpoint_if_available(
+        params=params, model=teacher_model, model_avg=teacher_model_avg, teacher=True
+    )
     checkpoints = load_checkpoint_if_available(
-        params=params, model=model, model_avg=model_avg
+        params=params, model=student_model, model_avg=model_avg
     )
 
-    model.to(device)
+    student_model.to(device)
+    teacher_model.to(device)
     if world_size > 1:
         logging.info("Using DDP")
-        model = DDP(model, device_ids=[rank])
+        student_model = DDP(student_model, device_ids=[rank])
 
-    optimizer = Eve(model.parameters(), lr=params.initial_lr)
+    for k, p in teacher_model.named_parameters():
+        p.requires_grad = False
+
+    optimizer = Eve(student_model.parameters(), lr=params.initial_lr)
 
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
 
@@ -1015,7 +1118,7 @@ def run(rank, world_size, args):
         opts = diagnostics.TensorDiagnosticOptions(
             2**22
         )  # allow 4 megabytes per sub-module
-        diagnostic = diagnostics.attach_diagnostics(model, opts)
+        diagnostic = diagnostics.attach_diagnostics(student_model, opts)
 
     librispeech = LibriSpeechAsrDataModule(args)
 
@@ -1078,15 +1181,15 @@ def run(rank, world_size, args):
     valid_cuts += librispeech.dev_other_cuts()
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
-    if params.start_batch <= 0 and not params.print_diagnostics:
-        scan_pessimistic_batches_for_oom(
-            model=model,
-            train_dl=train_dl,
-            optimizer=optimizer,
-            sp=sp,
-            params=params,
-            warmup=0.0 if params.start_epoch == 1 else 1.0,
-        )
+    # if params.start_batch <= 0 and not params.print_diagnostics:
+    #     scan_pessimistic_batches_for_oom(
+    #         model=student_model,
+    #         train_dl=train_dl,
+    #         optimizer=optimizer,
+    #         sp=sp,
+    #         params=params,
+    #         warmup=0.0 if params.start_epoch == 1 else 1.0,
+    #     )
 
     scaler = GradScaler(enabled=params.use_fp16)
     if checkpoints and "grad_scaler" in checkpoints:
@@ -1105,7 +1208,8 @@ def run(rank, world_size, args):
 
         train_one_epoch(
             params=params,
-            model=model,
+            teacher_model=teacher_model,
+            student_model=student_model,
             model_avg=model_avg,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -1124,7 +1228,7 @@ def run(rank, world_size, args):
 
         save_checkpoint(
             params=params,
-            model=model,
+            model=student_model,
             model_avg=model_avg,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -1141,7 +1245,8 @@ def run(rank, world_size, args):
 
 
 def scan_pessimistic_batches_for_oom(
-    model: Union[nn.Module, DDP],
+    teacher_model: Union[nn.Module, DDP],
+    student_model: Union[nn.Module, DDP],
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     sp: spm.SentencePieceProcessor,
@@ -1160,7 +1265,8 @@ def scan_pessimistic_batches_for_oom(
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
                 loss, _ = compute_loss(
                     params=params,
-                    model=model,
+                    teacher_model=model,
+                    student_model=model,
                     sp=sp,
                     batch=batch,
                     is_training=True,

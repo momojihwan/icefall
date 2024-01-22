@@ -136,7 +136,7 @@ class Conformer(EncoderInterface):
         self._init_state: List[torch.Tensor] = [torch.empty(0)]
 
     def forward(
-        self, x: torch.Tensor, x_lens: torch.Tensor, warmup: float = 1.0
+        self, x: torch.Tensor, x_lens: torch.Tensor, warmup: float = 2.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -253,7 +253,7 @@ class Conformer(EncoderInterface):
         right_context: int = 4,
         chunk_size: int = 16,
         simulate_streaming: bool = False,
-        warmup: float = 1.0,
+        warmup: float = 2.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
         Args:
@@ -471,7 +471,7 @@ class ConformerEncoderLayer(nn.Module):
         pos_emb: Tensor,
         src_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
-        warmup: float = 1.0,
+        warmup: float = 2.0,
     ) -> Tensor:
         """
         Pass the input through the encoder layer.
@@ -541,7 +541,7 @@ class ConformerEncoderLayer(nn.Module):
         states: List[Tensor],
         src_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
-        warmup: float = 1.0,
+        warmup: float = 2.0,
         left_context: int = 0,
         right_context: int = 0,
     ) -> Tuple[Tensor, List[Tensor]]:
@@ -671,7 +671,7 @@ class ConformerEncoder(nn.Module):
         pos_emb: Tensor,
         mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
-        warmup: float = 1.0,
+        warmup: float = 2.0,
     ) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
 
@@ -716,7 +716,7 @@ class ConformerEncoder(nn.Module):
         states: List[Tensor],
         mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
-        warmup: float = 1.0,
+        warmup: float = 2.0,
         left_context: int = 0,
         right_context: int = 0,
     ) -> Tuple[Tensor, List[Tensor]]:
@@ -1816,7 +1816,7 @@ if __name__ == "__main__":
     f = c(
         torch.randn(batch_size, seq_len, feature_dim),
         torch.full((batch_size,), seq_len, dtype=torch.int64),
-        warmup=0.5,
+        warmup=2.0,
     )
 
     _test_random_combine_main()

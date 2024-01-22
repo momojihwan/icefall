@@ -65,7 +65,7 @@ from joiner import Joiner
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
-from model import Transducer
+from model import Transducer, Cascaded_transducer
 from optim import Eden, Eve
 from torch import Tensor
 from torch.cuda.amp import GradScaler
@@ -119,6 +119,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         type=int,
         default=512,
         help="Attention dimension in the conformer encoder layer.",
+    )
+    
+    parser.add_argument(
+        "--cas-encoder-dim",
+        type=int,
+        default=512,
+        help="Attention dimension in the non-causal conformer encoder layer.",
     )
 
     parser.add_argument(
@@ -296,6 +303,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--cas-loss-scale",
+        type=float,
+        default=0.7,
+        help="The scale to train the cascaded network.",
+    )
+
+    parser.add_argument(
         "--simple-loss-scale",
         type=float,
         default=0.5,
@@ -460,6 +474,21 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
     )
     return encoder
 
+def get_cascade_encoder_model(params: AttributeDict) -> nn.Module:
+    cascade_encoder = Conformer(
+        num_features=params.encoder_dim,
+        subsampling_factor=params.subsampling_factor,
+        d_model=params.encoder_dim,
+        nhead=params.nhead,
+        dim_feedforward=params.dim_feedforward,
+        num_encoder_layers=params.num_encoder_layers,
+        dynamic_chunk_training=not params.dynamic_chunk_training,
+        short_chunk_size=params.short_chunk_size,
+        num_left_chunks=params.num_left_chunks,
+        causal=not params.causal_convolution,
+    )
+    
+    return cascade_encoder
 
 def get_decoder_model(params: AttributeDict) -> nn.Module:
     decoder = Decoder(
@@ -483,14 +512,17 @@ def get_joiner_model(params: AttributeDict) -> nn.Module:
 
 def get_transducer_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
+    cascade_encoder = get_cascade_encoder_model(params)
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
 
-    model = Transducer(
+    model = Cascaded_transducer(
         encoder=encoder,
+        cascade_encoder=cascade_encoder,
         decoder=decoder,
         joiner=joiner,
         encoder_dim=params.encoder_dim,
+        cascade_encoder_dim=params.encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
@@ -654,7 +686,7 @@ def compute_loss(
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss = model(
+        non_causal_loss, cas_loss = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
@@ -665,38 +697,8 @@ def compute_loss(
             reduction="none",
             delay_penalty=params.delay_penalty if warmup >= 2.0 else 0,
         )
-        simple_loss_is_finite = torch.isfinite(simple_loss)
-        pruned_loss_is_finite = torch.isfinite(pruned_loss)
-        is_finite = simple_loss_is_finite & pruned_loss_is_finite
-        if not torch.all(is_finite):
-            logging.info(
-                "Not all losses are finite!\n"
-                f"simple_loss: {simple_loss}\n"
-                f"pruned_loss: {pruned_loss}"
-            )
-            display_and_save_batch(batch, params=params, sp=sp)
-            simple_loss = simple_loss[simple_loss_is_finite]
-            pruned_loss = pruned_loss[pruned_loss_is_finite]
 
-            # If the batch contains more than 10 utterances AND
-            # if either all simple_loss or pruned_loss is inf or nan,
-            # we stop the training process by raising an exception
-            if torch.all(~simple_loss_is_finite) or torch.all(~pruned_loss_is_finite):
-                raise ValueError(
-                    "There are too many utterances in this batch "
-                    "leading to inf or nan losses."
-                )
-
-        simple_loss = simple_loss.sum()
-        pruned_loss = pruned_loss.sum()
-        # after the main warmup step, we keep pruned_loss_scale small
-        # for the same amount of time (model_warm_step), to avoid
-        # overwhelming the simple_loss and causing it to diverge,
-        # in case it had not fully learned the alignment yet.
-        pruned_loss_scale = (
-            0.0 if warmup < 1.0 else (0.1 if warmup > 1.0 and warmup < 2.0 else 1.0)
-        )
-        loss = params.simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+        loss = params.cas_loss_scale * cas_loss + (1 - params.cas_loss_scale) * non_causal_loss
 
     assert loss.requires_grad == is_training
 
@@ -720,8 +722,8 @@ def compute_loss(
 
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
-    info["simple_loss"] = simple_loss.detach().cpu().item()
-    info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    info["non_causal_loss"] = non_causal_loss.detach().cpu().item()
+    info["cas_loss"] = cas_loss.detach().cpu().item()
 
     return loss, info
 
